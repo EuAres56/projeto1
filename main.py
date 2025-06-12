@@ -1,26 +1,53 @@
 import pandas as pd
-import requests
 import gzip
-import io
 import itertools
-import json
 import os
-import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from collections import defaultdict
+#para pontos que pedem maior leitura de codigo
+import xlr8
+#para leitura eficiente de json, melhor que a json padrão em termos de desempenho
+import orjson
+#para dowload mais eficiente que requests
+import httpx
+#para obter horarios e fazer calculos com horas
+import time
 
 class main():
     def iniciar(self):
+        #Captura hora inicial, iniciando cronometro
+        start_time = time.time()
+        
         urlBase = 'https://data.gharchive.org/2025-06-07-14.json.gz'
         arq = urlBase.split('/')[-1]
         print('\n')
-        print('Iniciando captura de logs')
+        print('Iniciando download dos logs')
         #Dowload dos logs
         self.baixarLogs(urlBase)
+        # para o cronômetro
+        download_time = time.time() - start_time
+        print(f'Tempo de download de: {download_time}')
+
+        #Captura hora inicial, iniciando cronometro
+        start_time = time.time()
+
         #Converte para dicionário separando por tipo de evento
         dicLogs = self.convertToDic(arq)
+        # para o cronômetro
+        dict_time = time.time() - start_time
+        print(f'Convertido em dict em: {dict_time}')
+
+        #Captura hora inicial, iniciando cronometro
+        start_time = time.time()
+
         #Converte dicionário em data frame
         dateFrame = self.convertToDF(dicLogs)
+        # para o cronômetro
+        dtFrame_time = time.time() - start_time
+        print(f'DataFrame estruturado em: {dtFrame_time}')
+
+        #Captura hora inicial, iniciando cronometro
+        start_time = time.time()
+
         #Calcula o total de usuários
         totalUser = dateFrame.shape[1]
         #Calcula o total de eventos realizado por cada usuário
@@ -46,58 +73,52 @@ class main():
         
         #deleta arquivo
         os.remove(arq)
+        
+        #processamentos rapidos
+        spProccess_time = time.time() - start_time
+        print(f'Processos adicionais em: {spProccess_time}')
+
+        # tempo total
+        procces_time = download_time + dict_time + dtFrame_time + spProccess_time
+        print(f'Tempo de processamento de: {procces_time-download_time}')
+        print(f'Tempo total de execução de: {procces_time}')
       
     def baixarLogs(self, url):
-        response = requests.get(url, stream=True)
+        response = httpx.Client().get(url)
 
         # Nome do arquivo local
         arquivo_gz = url.split('/')[-1] 
 
         if response.status_code == 200:
             with open(arquivo_gz, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=1024*1024):
-                    f.write(chunk)
-            print(f"Download concluído: {arquivo_gz}")
+                f.write(response.content)
         else:
             print(f"Erro ao baixar: {response.status_code}")
             exit()
 
     def convertToDic(self, nameArq):
-        userDic = {}
-
         #Define número de linhas por chunk dependo do numero de núcleos no cpu
         nCPU = os.cpu_count()
-        size = 10000
-        if nCPU > 4: size = 20000
-        if nCPU > 8: size = 30000
+        size = 15000
+        if nCPU > 4: size = 30000
+        if nCPU > 8: size = 50000
 
         #Faz a leitura do arquivo json
-        with gzip.open(nameArq, 'rt', encoding='utf-8') as strLogs:
+        with gzip.open(nameArq, 'rb') as strLogs:
             with ProcessPoolExecutor(max_workers=os.cpu_count()-1) as executor:
                 futures = [executor.submit(processarLines, chunk) for chunk in self.chunkIterator(strLogs, size)]
                 
                 # Combina os resultados
+                listParcials = []
                 for future in as_completed(futures):
-                    partialDic = future.result()
-                    for user in partialDic:
-                        if user not in userDic:
-                            userDic[user] = partialDic[user]
-                        else:
-                            for part in partialDic[user]:
-                                if part != 'login':
-                                    if part not in userDic[user]: userDic[user][part] = partialDic[user][part]
-                                    else:
-                                        n1 = userDic[user][part]
-                                        n2 = partialDic[user][part]
-                                        userDic[user][part] = n1 + n2
+                    listParcials.append(future.result())
 
-        print('\nOs dados foram tratados e convertidos em um dicionário!')
+        userDic = xlr8.combinaUsers(listParcials)
         return userDic
 
     def convertToDF(self, dicLogs):
         #Cria data frame e substitui valores vazios por 0
         df = pd.DataFrame(dicLogs).fillna(0)
-        print('O dicionário foi convertido em um data frame!')
         return df
 
     def calcularTotalEventos(self, df):
@@ -124,7 +145,10 @@ def processarLines(strLogs):
     errors = 0
     for log in strLogs:
         try:
-            jsLog = json.loads(log)
+            if isinstance(log, str):
+                jsLog = orjson.loads(log.encode())
+            else:
+                jsLog = orjson.loads(log)
             user = jsLog['actor']
             uId = user['id']
             event = jsLog['type']
@@ -135,7 +159,7 @@ def processarLines(strLogs):
 
             if event not in partDic[uId]: partDic[uId][event] = 0
             partDic[uId][event] += 1
-        except json.JSONDecodeError:
+        except orjson.JSONDecodeError:
             errors += 1
             continue
     if errors > 0:
